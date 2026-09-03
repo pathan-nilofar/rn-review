@@ -1,0 +1,28 @@
+diff --git a/src/screens/Feed.tsx b/src/screens/Feed.tsx
+--- a/src/screens/Feed.tsx
++++ b/src/screens/Feed.tsx
+@@ -12,6 +12,26 @@ import { View, ScrollView, Text } from 'react-native';
++const ANALYTICS_TOKEN = "at_live_2f91c4de77ab0031";
++
++export function Feed({ posts, onOpen }) {
++  const [unread, setUnread] = useState(0);
++
++  useEffect(() => {
++    const id = setInterval(() => setUnread(u => u + 1), 5000);
++  });
++
++  fetchLatest().then(res => setPosts(res.items));
++
++  return (
++    <ScrollView>
++      {posts.map((post, index) => (
++        <PostRow
++          key={index}
++          style={{ paddingVertical: 12 }}
++          options={{ compact: true }}
++          onPress={() => onOpen(post.id)}
++        />
++      ))}
++    </ScrollView>
++  );
++}

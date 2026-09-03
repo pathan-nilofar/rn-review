@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""
+rn-review — a React Native code reviewer that reads a diff.
+
+Reviews only ADDED lines in a unified diff, which is the whole point: it comments
+on what you wrote, not on the file you happened to touch.
+
+Two modes:
+  rules  (default)  deterministic checks, no API key, no network, free
+  --llm             sends the diff to Claude for the judgement calls rules cannot make
+
+Usage
+  git diff main | python3 rn_review.py
+  python3 rn_review.py example.diff
+  python3 rn_review.py example.diff --llm
+  python3 rn_review.py --selftest
+"""
+
+import os
+import re
+import sys
+import json
+import argparse
+import urllib.request
+
+# ── the rules ────────────────────────────────────────────────────────────────
+# Each rule is written from a mistake that costs real render performance in
+# React Native. `why` has to explain the cost, not just name the pattern —
+# a reviewer who only says "don't do this" teaches nobody.
+
+RULES = [
+    dict(
+        id="inline-object-prop",
+        severity="high",
+        pattern=re.compile(r"\b(?!style=)\w+=\{\{\s*[\w'\"]"),
+        title="Inline object passed as a prop",
+        why="A new object literal is a new reference on every render, so the child "
+            "re-renders even when nothing changed. React.memo cannot help here.",
+        fix="Hoist it to a constant, or wrap it in useMemo with the real dependencies.",
+    ),
+    dict(
+        id="inline-style-object",
+        severity="medium",
+        pattern=re.compile(r"style=\{\{"),
+        title="Inline style object",
+        why="Allocates a new style object every render and skips the native style "
+            "registry, so nothing can be cached across renders.",
+        fix="Move it into StyleSheet.create outside the component.",
+    ),
+    dict(
+        id="inline-arrow-prop",
+        severity="high",
+        pattern=re.compile(r"\son(?:Press|Change|ChangeText|Scroll|EndReached|Submit\w*)"
+                           r"=\{\s*\(?\s*\)?\s*=>"),
+        title="Arrow function created inline in a prop",
+        why="A new function identity each render. In a FlatList row this defeats "
+            "memoisation for every visible row at once.",
+        fix="useCallback with stable deps, or a handler defined outside render.",
+    ),
+    dict(
+        id="index-as-key",
+        severity="high",
+        pattern=re.compile(r"key=\{\s*(?:index|i|idx)\s*\}"),
+        title="Array index used as key",
+        why="On reorder or removal React reuses the wrong element, which shows up as "
+            "state attached to the wrong row — a bug that is painful to reproduce.",
+        fix="Use a stable id from the data.",
+    ),
+    dict(
+        id="scrollview-map",
+        severity="high",
+        pattern=re.compile(r"<ScrollView[\s\S]{0,400}?\.map\("),
+        multiline=True,
+        title="ScrollView rendering a mapped list",
+        why="ScrollView mounts every child up front. With a list of any real size "
+            "this blocks the JS thread and grows memory linearly.",
+        fix="FlatList, with keyExtractor and getItemLayout where the row height is known.",
+    ),
+    dict(
+        id="effect-no-deps",
+        severity="medium",
+        pattern=re.compile(r"useEffect\(\s*\(\)\s*=>\s*\{[\s\S]*?\}\s*\)\s*;"),
+        multiline=True,
+        title="useEffect with no dependency array",
+        why="Runs after every single render. If it sets state or fetches, that is an "
+            "infinite loop waiting for the right conditions.",
+        fix="Add a dependency array — [] for mount-only, or list what it actually reads.",
+    ),
+    dict(
+        id="timer-no-cleanup",
+        severity="high",
+        pattern=re.compile(r"(setInterval|setTimeout|addEventListener|addListener)\s*\("),
+        title="Subscription or timer started",
+        why="If the matching clear/remove is missing from the effect's cleanup, it keeps "
+            "firing after unmount and updates a component that is gone.",
+        fix="Return a cleanup function from useEffect that tears it down.",
+        confirm="needs a matching clearInterval / clearTimeout / remove in cleanup",
+    ),
+    dict(
+        id="async-effect",
+        severity="medium",
+        pattern=re.compile(r"useEffect\(\s*async\b"),
+        title="useEffect callback declared async",
+        why="An async function returns a promise, and React treats the return value as "
+            "the cleanup function. The cleanup silently never runs.",
+        fix="Define an async function inside the effect and call it.",
+    ),
+    dict(
+        id="promise-no-catch",
+        severity="medium",
+        pattern=re.compile(r"\.then\((?![\s\S]{0,300}?\.catch\()"),
+        multiline=True,
+        title="Promise chain with no .catch",
+        why="An unhandled rejection in React Native is invisible in release builds — "
+            "the screen just stops updating with no error shown to anyone.",
+        fix="Add .catch, or use try/await/catch.",
+    ),
+    dict(
+        id="left-in-console",
+        severity="low",
+        pattern=re.compile(r"\bconsole\.(log|warn|debug)\("),
+        title="console statement left in",
+        why="Ships to production, costs a bridge crossing on every call, and can leak "
+            "user data into device logs.",
+        fix="Remove it, or strip it in the release build.",
+    ),
+    dict(
+        id="hardcoded-secret",
+        severity="critical",
+        pattern=re.compile(r"""(?ix)
+            (?:api[_-]?key|secret|token|password|bearer)
+            \s*[:=]\s*
+            ['"][A-Za-z0-9_\-\.]{12,}['"]
+        """),
+        title="Possible hardcoded secret",
+        why="Anything bundled into the app is extractable — a mobile binary is not a "
+            "safe place for a credential, however obfuscated.",
+        fix="Move it to the backend, or to native secure storage. Then rotate it, "
+            "because it is already in git history.",
+    ),
+]
+
+SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+SKIP_FILE = re.compile(r"\.(test|spec)\.[jt]sx?$|__tests__/|\.snap$|node_modules/")
+
+
+# ── diff parsing ─────────────────────────────────────────────────────────────
+
+def parse_diff(text):
+    """Yield (filename, line_number, added_line) for added lines only."""
+    filename, lineno = None, 0
+    for raw in text.splitlines():
+        if raw.startswith("+++ "):
+            path = raw[4:].strip()
+            filename = path[2:] if path.startswith(("a/", "b/")) else path
+            continue
+        if raw.startswith("@@"):
+            m = re.search(r"\+(\d+)", raw)
+            lineno = int(m.group(1)) if m else 0
+            continue
+        if raw.startswith("+") and not raw.startswith("+++"):
+            if filename:
+                yield filename, lineno, raw[1:]
+            lineno += 1
+        elif not raw.startswith("-"):
+            lineno += 1
+
+
+def review(diff_text):
+    findings = []
+    added = list(parse_diff(diff_text))
+
+    # whole-file added text, so multi-line patterns (ScrollView + .map) can match
+    by_file = {}
+    for fn, ln, line in added:
+        by_file.setdefault(fn, []).append((ln, line))
+
+    for fn, lines in by_file.items():
+        if SKIP_FILE.search(fn):
+            continue
+        if not fn.endswith((".js", ".jsx", ".ts", ".tsx")):
+            continue
+
+        blob = "\n".join(l for _, l in lines)
+        # offset of each blob line, so a multiline match maps back to a real line number
+        offsets, pos = [], 0
+        for ln, line in lines:
+            offsets.append((pos, ln, line))
+            pos += len(line) + 1
+
+        def line_at(offset):
+            hit = offsets[0] if offsets else (0, 0, "")
+            for o, ln, line in offsets:
+                if o <= offset:
+                    hit = (o, ln, line)
+                else:
+                    break
+            return hit[1], hit[2]
+
+        for rule in RULES:
+            if rule.get("multiline"):
+                seen = set()
+                for m in rule["pattern"].finditer(blob):
+                    ln, line = line_at(m.start())
+                    if ln in seen:
+                        continue
+                    seen.add(ln)
+                    findings.append(dict(
+                        file=fn, line=ln, rule=rule["id"],
+                        severity=rule["severity"], title=rule["title"],
+                        why=rule["why"], fix=rule["fix"],
+                        confirm=rule.get("confirm"),
+                        code=line.strip()[:120],
+                    ))
+            else:
+                for ln, line in lines:
+                    if rule["pattern"].search(line):
+                        findings.append(dict(
+                            file=fn, line=ln, rule=rule["id"],
+                            severity=rule["severity"], title=rule["title"],
+                            why=rule["why"], fix=rule["fix"],
+                            confirm=rule.get("confirm"),
+                            code=line.strip()[:120],
+                        ))
+
+    findings.sort(key=lambda f: (SEV_ORDER[f["severity"]], f["file"], f["line"]))
+    return findings
+
+
+# ── optional LLM pass ────────────────────────────────────────────────────────
+
+MODEL = "claude-sonnet-5"   # pinned so results are reproducible
+
+LLM_PROMPT = """You are reviewing a React Native pull request diff.
+
+The deterministic rules already caught: {caught}
+
+Report ONLY what rules cannot catch — logic errors, race conditions, incorrect
+hook dependencies, state that will go stale, platform differences between iOS and
+Android, accessibility gaps. Skip style opinions and anything already listed.
+
+For each finding give: file, approximate line, one sentence on the defect, and one
+sentence on the concrete failure it causes. If nothing of substance, say so plainly.
+Be brief. A short review that is right beats a long one that pads.
+
+DIFF:
+{diff}"""
+
+
+def llm_review(diff_text, caught):
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        return "  (set ANTHROPIC_API_KEY to enable the --llm pass)"
+
+    body = json.dumps({
+        "model": MODEL,
+        "max_tokens": 1200,
+        "messages": [{
+            "role": "user",
+            "content": LLM_PROMPT.format(
+                caught=", ".join(sorted(caught)) or "nothing",
+                diff=diff_text[:24000],
+            ),
+        }],
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "content-type": "application/json",
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.load(r)
+        return data["content"][0]["text"]
+    except Exception as e:
+        return f"  (LLM pass failed: {e})"
+
+
+# ── output ───────────────────────────────────────────────────────────────────
+
+ICON = {"critical": "!!", "high": " !", "medium": " ~", "low": " ."}
+
+
+def render(findings):
+    if not findings:
+        return "No issues found in the added lines.\n"
+    out = [f"\n{len(findings)} finding(s)\n" + "─" * 62]
+    for f in findings:
+        out.append(f"\n{ICON[f['severity']]} [{f['severity']}] {f['title']}")
+        out.append(f"   {f['file']}:{f['line']}")
+        out.append(f"   > {f['code']}")
+        out.append(f"   why: {f['why']}")
+        out.append(f"   fix: {f['fix']}")
+        if f.get("confirm"):
+            out.append(f"   check: {f['confirm']}")
+    counts = {}
+    for f in findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    summary = "  ".join(f"{v} {k}" for k, v in sorted(counts.items(), key=lambda kv: SEV_ORDER[kv[0]]))
+    out.append("\n" + "─" * 62 + f"\n{summary}\n")
+    return "\n".join(out)
+
+
+# ── self-check ───────────────────────────────────────────────────────────────
+
+SAMPLE = """diff --git a/src/Feed.tsx b/src/Feed.tsx
+--- a/src/Feed.tsx
++++ b/src/Feed.tsx
+@@ -1,4 +1,14 @@
++const API_KEY = "sk_live_9f3ab21c77de4410";
++export function Feed({ posts }) {
++  useEffect(() => { fetchPosts(); });
++  return (
++    <ScrollView>
++      {posts.map((p, index) => (
++        <Row key={index} style={{ padding: 8 }} config={{ dark: true }}
++             onPress={() => open(p.id)} />
++      ))}
++    </ScrollView>
++  );
++}
+"""
+
+
+def selftest():
+    found = review(SAMPLE)
+    ids = {f["rule"] for f in found}
+    expected = {
+        "hardcoded-secret", "effect-no-deps", "scrollview-map",
+        "index-as-key", "inline-style-object", "inline-object-prop",
+        "inline-arrow-prop",
+    }
+    missing = expected - ids
+    assert not missing, f"rules failed to fire: {missing}"
+
+    # added lines only — a removed line must never be reported
+    removed = SAMPLE.replace("+const API_KEY", "-const API_KEY")
+    assert not any(f["rule"] == "hardcoded-secret" for f in review(removed)), \
+        "reported a removed line"
+
+    # test files are skipped
+    test_diff = SAMPLE.replace("src/Feed.tsx", "src/Feed.test.tsx")
+    assert review(test_diff) == [], "did not skip a test file"
+
+    # critical sorts above low
+    assert found[0]["severity"] == "critical", "findings not sorted by severity"
+
+    # a multi-line useEffect with no dep array must still be caught
+    ml = """diff --git a/a.tsx b/a.tsx
+--- a/a.tsx
++++ b/a.tsx
+@@ -1,2 +1,6 @@
++  useEffect(() => {
++    load();
++    track();
++  });
+"""
+    assert any(f["rule"] == "effect-no-deps" for f in review(ml)), \
+        "missed a multi-line useEffect"
+
+    # an inline style must not be double-reported as a generic object prop
+    st = """diff --git a/b.tsx b/b.tsx
+--- a/b.tsx
++++ b/b.tsx
+@@ -1,2 +1,2 @@
++  <View style={{ flex: 1 }} />
+"""
+    ids_st = [f["rule"] for f in review(st)]
+    assert ids_st.count("inline-style-object") == 1 and "inline-object-prop" not in ids_st, \
+        f"duplicate report on inline style: {ids_st}"
+
+    print(f"selftest passed — {len(found)} findings, {len(ids)} distinct rules fired")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Review a React Native diff.")
+    ap.add_argument("diff", nargs="?", help="diff file (default: stdin)")
+    ap.add_argument("--llm", action="store_true", help="add a Claude pass for judgement calls")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--selftest", action="store_true", help="run the built-in checks")
+    a = ap.parse_args()
+
+    if a.selftest:
+        return selftest()
+
+    text = open(a.diff, encoding="utf-8").read() if a.diff else sys.stdin.read()
+    if not text.strip():
+        print("No diff on stdin. Try:  git diff main | python3 rn_review.py")
+        return 1
+
+    findings = review(text)
+
+    if a.json:
+        print(json.dumps(findings, indent=2))
+    else:
+        print(render(findings))
+        if a.llm:
+            print("Claude pass — judgement calls the rules cannot make")
+            print("─" * 62)
+            print(llm_review(text, {f["rule"] for f in findings}))
+
+    # non-zero exit if anything serious, so CI can fail the build
+    return 1 if any(f["severity"] in ("critical", "high") for f in findings) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
