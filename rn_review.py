@@ -306,6 +306,104 @@ def render(findings):
     return "\n".join(out)
 
 
+# ── GitHub: fetch a PR, post a review ────────────────────────────────────────
+
+GH_API = "https://api.github.com"
+PR_URL = re.compile(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)")
+
+
+def gh_token():
+    """Env var first, then whatever the gh CLI already has. No prompting, no storing."""
+    t = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if t:
+        return t
+    try:
+        import subprocess
+        r = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def gh_request(path, token, accept="application/vnd.github+json", data=None, method=None):
+    req = urllib.request.Request(
+        GH_API + path,
+        data=json.dumps(data).encode() if data is not None else None,
+        method=method or ("POST" if data is not None else "GET"),
+        headers={
+            "Accept": accept,
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "rn-review",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=45) as r:
+        raw = r.read().decode()
+    return raw if "diff" in accept else json.loads(raw)
+
+
+def parse_pr_url(url):
+    m = PR_URL.search(url)
+    if not m:
+        raise SystemExit(f"Not a pull request URL: {url}\n"
+                         "Expected: https://github.com/owner/repo/pull/123")
+    return m.group(1), m.group(2), int(m.group(3))
+
+
+def fetch_pr(owner, repo, num, token):
+    diff = gh_request(f"/repos/{owner}/{repo}/pulls/{num}", token,
+                      accept="application/vnd.github.v3.diff")
+    meta = gh_request(f"/repos/{owner}/{repo}/pulls/{num}", token)
+    return diff, meta
+
+
+def post_review(owner, repo, num, sha, findings, token):
+    """Inline comments where GitHub accepts them, the rest collected in the body."""
+    counts = {}
+    for f in findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    summary = "  ·  ".join(f"**{counts[s]}** {s}"
+                           for s in sorted(counts, key=lambda k: SEV_ORDER[k]))
+
+    comments = [{
+        "path": f["file"],
+        "line": max(1, f["line"]),
+        "side": "RIGHT",
+        "body": (f"**{f['severity'].upper()} — {f['title']}**\n\n"
+                 f"{f['why']}\n\n"
+                 f"**Fix:** {f['fix']}"
+                 + (f"\n\n**Check:** {f['confirm']}" if f.get("confirm") else "")),
+    } for f in findings]
+
+    body = (f"### rn-review\n\n{summary or 'No issues found.'}\n\n"
+            f"<sub>Rules pass over added lines only. "
+            f"[How it works](https://github.com/pathan-nilofar/rn-review)</sub>")
+
+    blocking = any(f["severity"] in ("critical", "high") for f in findings)
+    payload = {
+        "commit_id": sha,
+        "body": body,
+        "event": "COMMENT",          # never REQUEST_CHANGES — a bot should not block a human
+        "comments": comments,
+    }
+
+    try:
+        return gh_request(f"/repos/{owner}/{repo}/pulls/{num}/reviews", token, data=payload)
+    except urllib.error.HTTPError as e:
+        # a line outside the diff hunk is rejected; fall back to one summary comment
+        detail = e.read().decode()[:200]
+        lines = "\n".join(
+            f"- **{f['severity']}** `{f['file']}:{f['line']}` — {f['title']}. {f['fix']}"
+            for f in findings)
+        return gh_request(f"/repos/{owner}/{repo}/pulls/{num}/reviews", token,
+                          data={"commit_id": sha, "event": "COMMENT",
+                                "body": body + "\n\n" + lines +
+                                        f"\n\n<sub>inline anchoring failed: {detail}</sub>"})
+
+
 # ── html report ──────────────────────────────────────────────────────────────
 
 HTML_TMPL = """<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -482,7 +580,9 @@ def selftest():
 
 def main():
     ap = argparse.ArgumentParser(description="Review a React Native diff.")
-    ap.add_argument("diff", nargs="?", help="diff file (default: stdin)")
+    ap.add_argument("diff", nargs="?", help="diff file, or a GitHub PR URL (default: stdin)")
+    ap.add_argument("--post", action="store_true",
+                    help="post the review back to the PR (requires a PR URL)")
     ap.add_argument("--llm", action="store_true", help="add a Claude pass for judgement calls")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--html", metavar="FILE", help="write a visual report you can open in a browser")
@@ -492,12 +592,42 @@ def main():
     if a.selftest:
         return selftest()
 
-    text = open(a.diff, encoding="utf-8").read() if a.diff else sys.stdin.read()
+    pr = None
+    if a.diff and "github.com" in a.diff and "/pull/" in a.diff:
+        token = gh_token()
+        if not token:
+            print("No GitHub token. Set GITHUB_TOKEN, or run: gh auth login")
+            return 2
+        owner, repo, num = parse_pr_url(a.diff)
+        print(f"Fetching {owner}/{repo} PR #{num} ...")
+        text, meta = fetch_pr(owner, repo, num, token)
+        pr = dict(owner=owner, repo=repo, num=num, token=token,
+                  sha=meta["head"]["sha"], title=meta["title"],
+                  files=meta.get("changed_files", 0))
+        print(f'  "{pr["title"]}"  ·  {pr["files"]} file(s) changed\n')
+    elif a.diff:
+        text = open(a.diff, encoding="utf-8").read()
+    else:
+        text = sys.stdin.read()
+
     if not text.strip():
-        print("No diff on stdin. Try:  git diff main | python3 rn_review.py")
+        print("Nothing to review. Try:\n"
+              "  git diff main | python3 rn_review.py\n"
+              "  python3 rn_review.py https://github.com/owner/repo/pull/12")
         return 1
 
     findings = review(text)
+
+    if a.post:
+        if not pr:
+            print("--post needs a PR URL, not a diff file.")
+            return 2
+        if not findings:
+            print("Nothing to post — no findings.")
+            return 0
+        res = post_review(pr["owner"], pr["repo"], pr["num"], pr["sha"], findings, pr["token"])
+        print(f"Posted {len(findings)} finding(s) → {res.get('html_url', 'ok')}")
+        return 1 if any(f["severity"] in ("critical", "high") for f in findings) else 0
 
     if a.html:
         render_html(findings, a.html)

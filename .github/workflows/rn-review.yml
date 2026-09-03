@@ -1,0 +1,30 @@
+name: rn-review
+
+# Runs itself on every pull request. Nobody has to remember to run anything.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: ['**.js', '**.jsx', '**.ts', '**.tsx']
+
+permissions:
+  contents: read
+  pull-requests: write     # needed to post the review
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Review the pull request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 rn_review.py "${{ github.event.pull_request.html_url }}" --post
+
+      # The step above exits non-zero on critical/high, which fails the check.
+      # Drop `--post` for a dry run, or add `|| true` to report without blocking.

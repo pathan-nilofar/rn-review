@@ -10,6 +10,17 @@ of them are hard to spot. All of them are easy to miss at 6pm on a Friday.
 So I wrote down the checks I was doing by hand.
 
 ```
+$ python3 rn_review.py https://github.com/acme/app/pull/482 --post
+
+Fetching acme/app PR #482 ...
+  "Add unread badge to the feed"  ·  3 file(s) changed
+
+Posted 9 finding(s) → https://github.com/acme/app/pull/482#pullrequestreview-...
+```
+
+Or against your working branch:
+
+```
 $ git diff main | python3 rn_review.py
 
 9 finding(s)
@@ -60,9 +71,25 @@ substance" rather than pad.
 The split is deliberate. Anything expressible as a pattern should be a pattern — it is
 free, instant and never wrong in a different way each run. The model is for what is left.
 
-## Install
+## Three ways to run it
 
-None. Python 3.8+, standard library only.
+**1 — Autonomous, on every PR.** Copy `.github/workflows/rn-review.yml` into the repo you
+want reviewed. From then on it runs itself on every pull request and posts inline comments.
+Nobody has to remember anything. It uses the `GITHUB_TOKEN` the runner already provides,
+so there is nothing to configure.
+
+**2 — Point it at a PR.**
+
+```bash
+python3 rn_review.py https://github.com/owner/repo/pull/123          # dry run, prints locally
+python3 rn_review.py https://github.com/owner/repo/pull/123 --post   # posts the review
+```
+
+It authenticates from `GITHUB_TOKEN`, or from whatever `gh auth login` already has.
+**Nothing is posted without `--post`** — the default is always a dry run, because a tool
+that can comment on other people's work should say what it would do first.
+
+**3 — Locally, before you push.**
 
 ```bash
 git diff main | python3 rn_review.py     # review your branch
@@ -85,11 +112,17 @@ git diff main | python3 rn_review.py --llm
 line, and the reasoning. One file, no assets, no server. Useful for attaching to a PR, or
 for looking at a whole release branch at once.
 
-Exits non-zero when anything `critical` or `high` is found, so it can gate CI:
+### On the PR
 
-```yaml
-- run: git diff origin/main | python3 rn_review.py
-```
+Findings post as **inline review comments** on the exact line, each with the cost and the
+fix. If GitHub rejects a line — it only accepts comments inside a diff hunk — the review
+falls back to one summary comment rather than failing.
+
+The review is always posted as `COMMENT`, never `REQUEST_CHANGES`. **A bot should not
+block a human.** It reports; a person decides.
+
+Exits non-zero when anything `critical` or `high` is found, so the check fails and the
+status shows red on the PR.
 
 ## What it checks
 
@@ -130,14 +163,16 @@ The LLM pass covers some of this, at the cost of an API call and non-determinism
   quiet about a stray `console.log`.
 - **Model pinned** to `claude-sonnet-5` so a review is reproducible.
 - **Test files are skipped** — an index key in a fixture is not a bug.
+- **Dry run by default.** `--post` is opt-in. Anything that can write to someone else's
+  repository should have to be asked twice.
 - **One self-check, no framework.** `--selftest` asserts that every rule fires, that
   removed lines are never reported, that test files are skipped, that findings sort by
   severity, and that a multi-line `useEffect` is still caught.
 
 ## Next
 
-- Post findings as inline GitHub PR comments
 - Trend the report across releases, so the rule that keeps firing becomes visible
+- Resolve its own comments when the next push fixes the line
 - A project config for per-repo severity
 - Rules for `react-native-reanimated` worklets and `FlatList` prop misuse
 
