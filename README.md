@@ -10,7 +10,7 @@ of them are hard to spot. All of them are easy to miss at 6pm on a Friday.
 So I wrote down the checks I was doing by hand.
 
 ```
-$ python3 rn_review.py https://github.com/acme/app/pull/482 --post
+$ rn-review review this PR https://github.com/acme/app/pull/482 and post the comments
 
 Fetching acme/app PR #482 ...
   "Add unread badge to the feed"  ·  3 file(s) changed
@@ -70,6 +70,23 @@ substance" rather than pad.
 
 The split is deliberate. Anything expressible as a pattern should be a pattern — it is
 free, instant and never wrong in a different way each run. The model is for what is left.
+
+## Talk to it
+
+```bash
+rn-review review this PR https://github.com/acme/app/pull/482
+rn-review https://github.com/acme/app/pull/482 and post the comments
+rn-review check my branch
+rn-review my branch, open the report
+rn-review                                  # asks what you want
+```
+
+Intent is parsed with rules first — free, instant, deterministic. Claude is asked only
+when the rules cannot tell what you meant. That is the same split the reviewer itself
+uses, and for the same reason: a model call for "check my branch" would be slower, cost
+money, and occasionally get it wrong.
+
+`./install.sh` symlinks it onto your PATH.
 
 ## Three ways to run it
 

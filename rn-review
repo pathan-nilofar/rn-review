@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""
+rn-review — talk to it in plain English.
+
+    rn-review review this PR https://github.com/acme/app/pull/482
+    rn-review https://github.com/acme/app/pull/482 and post the comments
+    rn-review check my branch
+    rn-review                                  (asks what you want)
+
+Intent is parsed with rules first — free, instant, deterministic. Claude is asked
+only when the rules cannot tell what you meant, which is the same split the
+reviewer itself uses.
+"""
+
+import os
+import re
+import sys
+import json
+import subprocess
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import rn_review as core  # noqa: E402
+
+PR = re.compile(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+")
+
+# words that mean "actually write to the PR", not just show me
+POST = re.compile(r"\b(post|comment|publish|leave feedback|send it|push the review|"
+                  r"put (?:it|them|the comments) on)\b", re.I)
+DRY = re.compile(r"\b(dry.?run|just show|preview|don'?t post|without posting|locally)\b", re.I)
+BRANCH = re.compile(r"\b(my branch|this branch|the branch|working copy|uncommitted|"
+                    r"current changes|my changes|staged|my code|my diff|"
+                    r"what (?:have i|i have|i've|i) changed)\b", re.I)
+REPORT = re.compile(r"\b(report|html|open it|browser|visual|dashboard)\b", re.I)
+HELP = re.compile(r"^\s*(help|what can you do|\?|-h|--help)\s*$", re.I)
+
+
+def ask_claude(text):
+    """Only reached when the rules cannot classify the request."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        return None
+    prompt = (
+        "Classify this request for a React Native code-review tool. "
+        'Reply with ONLY a JSON object: {"action":"pr"|"branch"|"unknown",'
+        '"url":"<pr url or null>","post":true|false,"html":true|false}\n\n'
+        f"Request: {text}"
+    )
+    body = json.dumps({
+        "model": core.MODEL, "max_tokens": 200,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body,
+        headers={"content-type": "application/json", "x-api-key": key,
+                 "anthropic-version": "2023-06-01"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            out = json.load(r)["content"][0]["text"]
+        return json.loads(re.search(r"\{.*\}", out, re.S).group(0))
+    except Exception:
+        return None
+
+
+def understand(text):
+    """Rules first. Returns a plan, or None if it genuinely cannot tell."""
+    url = PR.search(text)
+    post = bool(POST.search(text)) and not DRY.search(text)
+    html = bool(REPORT.search(text))
+
+    if url:
+        return dict(action="pr", url=url.group(0), post=post, html=html)
+    if BRANCH.search(text) or not text.strip():
+        return dict(action="branch", url=None, post=False, html=html)
+    if "github.com" in text and "/pull/" not in text:
+        return dict(action="error",
+                    msg="That is a GitHub link but not a pull request. "
+                        "I need a URL ending in /pull/<number>.")
+    return None
+
+
+def git_diff():
+    for args in (["git", "diff", "origin/main"], ["git", "diff", "main"],
+                 ["git", "diff", "HEAD"], ["git", "diff"]):
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=25)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout
+        except Exception:
+            continue
+    return ""
+
+
+def run(plan):
+    if plan["action"] == "error":
+        print(plan["msg"])
+        return 2
+
+    if plan["action"] == "branch":
+        diff = git_diff()
+        if not diff.strip():
+            print("No changes found in this repository.")
+            return 0
+        findings = core.review(diff)
+        print(core.render(findings))
+        if plan["html"]:
+            p = os.path.abspath("rn-review-report.html")
+            core.render_html(findings, p)
+            print(f"Report: {p}")
+            subprocess.run(["open", p], capture_output=True)
+        return 1 if any(f["severity"] in ("critical", "high") for f in findings) else 0
+
+    # a pull request
+    token = core.gh_token()
+    if not token:
+        print("I need GitHub access. Run:  gh auth login")
+        return 2
+
+    owner, repo, num = core.parse_pr_url(plan["url"])
+    print(f"Reading {owner}/{repo} PR #{num} ...")
+    diff, meta = core.fetch_pr(owner, repo, num, token)
+    print(f'  "{meta["title"]}"  ·  {meta.get("changed_files", 0)} file(s) changed\n')
+
+    findings = core.review(diff)
+    print(core.render(findings))
+
+    if plan["html"]:
+        p = os.path.abspath(f"rn-review-pr{num}.html")
+        core.render_html(findings, p)
+        print(f"Report: {p}")
+        subprocess.run(["open", p], capture_output=True)
+
+    if plan["post"]:
+        if not findings:
+            print("Nothing to post — no findings.")
+        else:
+            # writing to someone else's PR: confirm unless clearly non-interactive
+            ok = True
+            if sys.stdin.isatty():
+                ans = input(f"Post {len(findings)} comment(s) to PR #{num}? [y/N] ")
+                ok = ans.strip().lower().startswith("y")
+            if ok:
+                res = core.post_review(owner, repo, num, meta["head"]["sha"],
+                                       findings, token)
+                print(f"Posted → {res.get('html_url', 'ok')}")
+            else:
+                print("Not posted.")
+    elif findings:
+        print("(add \"and post the comments\" to put these on the PR)")
+
+    return 1 if any(f["severity"] in ("critical", "high") for f in findings) else 0
+
+
+HELP_TEXT = """rn-review — a React Native code reviewer you can talk to.
+
+  rn-review review this PR https://github.com/acme/app/pull/482
+  rn-review https://github.com/acme/app/pull/482 and post the comments
+  rn-review check my branch
+  rn-review my branch, open the report
+  rn-review                         asks what you want
+
+It reads added lines only, explains what each mistake costs, and never posts
+without being asked. Details: https://github.com/pathan-nilofar/rn-review"""
+
+
+def main():
+    text = " ".join(sys.argv[1:]).strip()
+
+    if HELP.match(text):
+        print(HELP_TEXT)
+        return 0
+
+    if not text and sys.stdin.isatty():
+        print("What should I review? (paste a PR link, or say \"my branch\")")
+        try:
+            text = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+
+    plan = understand(text)
+
+    if plan is None:
+        plan = ask_claude(text)
+        if plan and plan.get("action") in ("pr", "branch"):
+            plan.setdefault("post", False)
+            plan.setdefault("html", False)
+        else:
+            print("I did not follow that.\n")
+            print(HELP_TEXT)
+            return 2
+
+    return run(plan)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
