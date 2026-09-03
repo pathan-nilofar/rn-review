@@ -67,6 +67,7 @@ None. Python 3.8+, standard library only.
 ```bash
 git diff main | python3 rn_review.py     # review your branch
 python3 rn_review.py example.diff        # try the sample
+python3 rn_review.py --html report.html  # visual report, open in a browser
 python3 rn_review.py --json              # machine-readable
 python3 rn_review.py --selftest          # built-in checks
 ```
@@ -77,6 +78,12 @@ For the LLM pass:
 export ANTHROPIC_API_KEY=sk-...
 git diff main | python3 rn_review.py --llm
 ```
+
+### The report
+
+`--html` writes a standalone report — severity bar, colour-coded findings, the offending
+line, and the reasoning. One file, no assets, no server. Useful for attaching to a PR, or
+for looking at a whole release branch at once.
 
 Exits non-zero when anything `critical` or `high` is found, so it can gate CI:
 
@@ -130,6 +137,7 @@ The LLM pass covers some of this, at the cost of an API call and non-determinism
 ## Next
 
 - Post findings as inline GitHub PR comments
+- Trend the report across releases, so the rule that keeps firing becomes visible
 - A project config for per-repo severity
 - Rules for `react-native-reanimated` worklets and `FlatList` prop misuse
 
