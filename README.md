@@ -34,6 +34,9 @@ $ git diff main | python3 rn_review.py
    fix: Move it to the backend, or to native secure storage. Then rotate it,
         because it is already in git history.
 
+     - const TOKEN = "at_live_2f91c4de77ab0031";
+     + const TOKEN = await Keychain.getGenericPassword();   // and rotate the old one
+
  ! [high] ScrollView rendering a mapped list
    src/screens/Feed.tsx:12
    > <ScrollView> ... .map(
@@ -175,7 +178,12 @@ The LLM pass covers some of this, at the cost of an API call and non-determinism
 ## Design notes
 
 - **Added lines only.** Reviewing whole files buries the change in pre-existing noise.
-- **Every rule carries `why` and `fix`.** A finding without a cost is nagging.
+- **Every rule carries `why`, `fix`, and the code.** A finding without a cost is
+  nagging; a fix without an example is homework.
+- **Applyable suggestions only where the replacement is unambiguous.** GitHub renders
+  a ` ```suggestion ` block as one-click apply. Emitting one for a fix that needs a
+  variable name this tool cannot see would let someone apply a wrong change with a
+  click — worse than no suggestion. Those show a collapsed before/after instead.
 - **Severity drives the exit code**, so CI blocks on `critical` and `high` and stays
   quiet about a stray `console.log`.
 - **Model pinned** to `claude-sonnet-5` so a review is reproducible.

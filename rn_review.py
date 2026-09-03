@@ -37,6 +37,8 @@ RULES = [
         why="A new object literal is a new reference on every render, so the child "
             "re-renders even when nothing changed. React.memo cannot help here.",
         fix="Hoist it to a constant, or wrap it in useMemo with the real dependencies.",
+        before='<PostRow options={{ compact: true }} />',
+        after='const ROW_OPTS = { compact: true };          // outside the component\n<PostRow options={ROW_OPTS} />',
     ),
     dict(
         id="inline-style-object",
@@ -46,6 +48,8 @@ RULES = [
         why="Allocates a new style object every render and skips the native style "
             "registry, so nothing can be cached across renders.",
         fix="Move it into StyleSheet.create outside the component.",
+        before='<View style={{ paddingVertical: 12 }} />',
+        after='const s = StyleSheet.create({ row: { paddingVertical: 12 } });\n<View style={s.row} />',
     ),
     dict(
         id="inline-arrow-prop",
@@ -56,6 +60,8 @@ RULES = [
         why="A new function identity each render. In a FlatList row this defeats "
             "memoisation for every visible row at once.",
         fix="useCallback with stable deps, or a handler defined outside render.",
+        before='<PostRow onPress={() => onOpen(post.id)} />',
+        after='const handlePress = useCallback(() => onOpen(post.id), [onOpen, post.id]);\n<PostRow onPress={handlePress} />',
     ),
     dict(
         id="index-as-key",
@@ -65,6 +71,8 @@ RULES = [
         why="On reorder or removal React reuses the wrong element, which shows up as "
             "state attached to the wrong row — a bug that is painful to reproduce.",
         fix="Use a stable id from the data.",
+        before='{posts.map((post, index) => <PostRow key={index} ... />)}',
+        after='{posts.map(post => <PostRow key={post.id} ... />)}',
     ),
     dict(
         id="scrollview-map",
@@ -75,6 +83,8 @@ RULES = [
         why="ScrollView mounts every child up front. With a list of any real size "
             "this blocks the JS thread and grows memory linearly.",
         fix="FlatList, with keyExtractor and getItemLayout where the row height is known.",
+        before='<ScrollView>\n  {posts.map(post => <PostRow ... />)}\n</ScrollView>',
+        after='<FlatList\n  data={posts}\n  keyExtractor={p => p.id}\n  renderItem={renderRow}       // defined outside render\n/>',
     ),
     dict(
         id="effect-no-deps",
@@ -85,6 +95,8 @@ RULES = [
         why="Runs after every single render. If it sets state or fetches, that is an "
             "infinite loop waiting for the right conditions.",
         fix="Add a dependency array — [] for mount-only, or list what it actually reads.",
+        before='useEffect(() => {\n  load();\n});',
+        after='useEffect(() => {\n  load();\n}, []);            // [] for mount-only, or list what it reads',
     ),
     dict(
         id="timer-no-cleanup",
@@ -95,6 +107,8 @@ RULES = [
             "firing after unmount and updates a component that is gone.",
         fix="Return a cleanup function from useEffect that tears it down.",
         confirm="needs a matching clearInterval / clearTimeout / remove in cleanup",
+        before='useEffect(() => {\n  const id = setInterval(tick, 5000);\n}, []);',
+        after='useEffect(() => {\n  const id = setInterval(tick, 5000);\n  return () => clearInterval(id);   // the missing line\n}, []);',
     ),
     dict(
         id="async-effect",
@@ -104,6 +118,8 @@ RULES = [
         why="An async function returns a promise, and React treats the return value as "
             "the cleanup function. The cleanup silently never runs.",
         fix="Define an async function inside the effect and call it.",
+        before='useEffect(async () => {\n  await load();\n}, []);',
+        after='useEffect(() => {\n  (async () => { await load(); })();\n}, []);',
     ),
     dict(
         id="promise-no-catch",
@@ -114,6 +130,8 @@ RULES = [
         why="An unhandled rejection in React Native is invisible in release builds — "
             "the screen just stops updating with no error shown to anyone.",
         fix="Add .catch, or use try/await/catch.",
+        before='fetchLatest().then(res => setPosts(res.items));',
+        after='fetchLatest()\n  .then(res => setPosts(res.items))\n  .catch(err => report(err));',
     ),
     dict(
         id="left-in-console",
@@ -123,6 +141,8 @@ RULES = [
         why="Ships to production, costs a bridge crossing on every call, and can leak "
             "user data into device logs.",
         fix="Remove it, or strip it in the release build.",
+        before="console.log('posts', posts);",
+        after='// remove it, or guard with __DEV__',
     ),
     dict(
         id="hardcoded-secret",
@@ -137,10 +157,17 @@ RULES = [
             "safe place for a credential, however obfuscated.",
         fix="Move it to the backend, or to native secure storage. Then rotate it, "
             "because it is already in git history.",
+        before='const TOKEN = "at_live_2f91c4de77ab0031";',
+        after='const TOKEN = await Keychain.getGenericPassword();   // and rotate the old one',
     ),
 ]
 
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+# Only these can be turned into an applyable GitHub suggestion. Everything else needs
+# a name or a surrounding block this tool cannot see, and a wrong suggestion that
+# someone clicks "apply" on is worse than no suggestion at all.
+APPLYABLE = {"left-in-console"}
 SKIP_FILE = re.compile(r"\.(test|spec)\.[jt]sx?$|__tests__/|\.snap$|node_modules/")
 
 
@@ -210,6 +237,7 @@ def review(diff_text):
                         severity=rule["severity"], title=rule["title"],
                         why=rule["why"], fix=rule["fix"],
                         confirm=rule.get("confirm"),
+                        before=rule.get("before"), after=rule.get("after"),
                         code=line.strip()[:120],
                     ))
             else:
@@ -220,6 +248,7 @@ def review(diff_text):
                             severity=rule["severity"], title=rule["title"],
                             why=rule["why"], fix=rule["fix"],
                             confirm=rule.get("confirm"),
+                            before=rule.get("before"), after=rule.get("after"),
                             code=line.strip()[:120],
                         ))
 
@@ -298,6 +327,12 @@ def render(findings):
         out.append(f"   fix: {f['fix']}")
         if f.get("confirm"):
             out.append(f"   check: {f['confirm']}")
+        if f.get("after"):
+            out.append("")
+            for ln in str(f["before"]).splitlines():
+                out.append(f"     - {ln}")
+            for ln in str(f["after"]).splitlines():
+                out.append(f"     + {ln}")
     counts = {}
     for f in findings:
         counts[f["severity"]] = counts.get(f["severity"], 0) + 1
@@ -360,6 +395,21 @@ def fetch_pr(owner, repo, num, token):
     return diff, meta
 
 
+def _comment_body(f):
+    """GitHub renders a ```suggestion block as a one-click apply. Only emit one where
+    the replacement is unambiguous — otherwise show the shape and let a human write it."""
+    body = (f"**{f['severity'].upper()} — {f['title']}**\n\n{f['why']}\n\n"
+            f"**Fix:** {f['fix']}")
+    if f.get("confirm"):
+        body += f"\n\n**Check:** {f['confirm']}"
+    if f["rule"] in APPLYABLE:
+        body += "\n\n```suggestion\n```"          # delete the line
+    elif f.get("after"):
+        body += f"\n\n<details><summary>What it should look like</summary>\n\n"
+        body += f"```diff\n- {f['before']}\n+ {f['after']}\n```\n\n</details>"
+    return body
+
+
 def post_review(owner, repo, num, sha, findings, token):
     """Inline comments where GitHub accepts them, the rest collected in the body."""
     counts = {}
@@ -372,10 +422,7 @@ def post_review(owner, repo, num, sha, findings, token):
         "path": f["file"],
         "line": max(1, f["line"]),
         "side": "RIGHT",
-        "body": (f"**{f['severity'].upper()} — {f['title']}**\n\n"
-                 f"{f['why']}\n\n"
-                 f"**Fix:** {f['fix']}"
-                 + (f"\n\n**Check:** {f['confirm']}" if f.get("confirm") else "")),
+        "body": _comment_body(f),
     } for f in findings]
 
     body = (f"### rn-review\n\n{summary or 'No issues found.'}\n\n"
@@ -433,6 +480,10 @@ color:var(--dim);margin-bottom:12px}}
 pre{{background:#0a0c12;border:1px solid var(--line);border-radius:8px;padding:12px 14px;
 overflow-x:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
 font-size:12.5px;color:#c4b8ff;margin-bottom:12px}}
+pre.d{{margin-top:6px;line-height:1.55}}
+pre.d span{{display:block}}
+.del{{color:#f87171;background:rgba(248,113,113,.07)}}
+.add{{color:#5eead4;background:rgba(94,234,212,.07)}}
 .row{{display:flex;gap:9px;font-size:14px;margin-bottom:6px}}
 .row span:first-child{{color:var(--dim);min-width:44px;flex-shrink:0}}
 .row span:last-child{{color:var(--muted)}}
@@ -476,6 +527,13 @@ def render_html(findings, path):
             chk = (f'<div class="row"><span>check</span>'
                    f'<span class="check">{H.escape(f["confirm"])}</span></div>'
                    if f.get("confirm") else "")
+            diff = ""
+            if f.get("after"):
+                minus = "".join(f'<span class="del">- {H.escape(l)}</span>\n'
+                                for l in str(f["before"]).splitlines())
+                plus = "".join(f'<span class="add">+ {H.escape(l)}</span>\n'
+                               for l in str(f["after"]).splitlines())
+                diff = f'<div class="row"><span>code</span></div><pre class="d">{minus}{plus}</pre>' 
             rows.append(
                 f'<div class="f" style="border-left-color:{c}">'
                 f'<h3><span class="sev" style="background:{c}22;color:{c}">{f["severity"]}</span>'
@@ -484,7 +542,7 @@ def render_html(findings, path):
                 f'<pre>{H.escape(f["code"])}</pre>'
                 f'<div class="row"><span>why</span><span>{H.escape(f["why"])}</span></div>'
                 f'<div class="row"><span>fix</span><span>{H.escape(f["fix"])}</span></div>'
-                f'{chk}</div>')
+                f'{chk}{diff}</div>')
         body = "".join(rows)
     else:
         bar = cnt = ""
